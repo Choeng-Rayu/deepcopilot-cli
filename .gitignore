@@ -1,0 +1,4 @@
+proxy/.env
+node_modules/
+*.log
+.cache/

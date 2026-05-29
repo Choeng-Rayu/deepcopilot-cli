@@ -1,0 +1,12 @@
+{
+  "name": "deepcopilot-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local OpenAI-compatible router proxy for GitHub Copilot BYOK (Nvidia, DeepSeek, Kimi-for-coding)",
+  "main": "router-proxy.js",
+  "scripts": {
+    "start": "node start-proxy.js"
+  },
+  "license": "MIT"
+}
