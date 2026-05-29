@@ -10,6 +10,9 @@
 # Usage:
 #   deepcopilot [-b nvidia|deepseek|kimi] [--port N] [-- copilot-args]
 #   deepcopilot --status          # show running proxy status
+#   deepcopilot --models          # list model ids to enable in VS Code
+#   deepcopilot --logs            # tail proxy requests (see what VS Code calls)
+#   deepcopilot --stop            # stop the proxy running on this port
 #   deepcopilot --vscode-setup    # point VS Code Copilot at the proxy (Ollama provider)
 #   deepcopilot --vscode-config   # print manual VS Code steps
 #   deepcopilot --help
@@ -49,6 +52,9 @@ while [[ $# -gt 0 ]]; do
         --backend|-b)          BACKEND="$2"; shift 2 ;;
         --port)                PORT="$2"; shift 2 ;;
         --status)              ACTION="status"; shift ;;
+        --models)              ACTION="models"; shift ;;
+        --logs)                ACTION="logs"; shift ;;
+        --stop)                ACTION="stop"; shift ;;
         --vscode-setup)        ACTION="vscode-setup"; shift ;;
         --vscode-config)       ACTION="vscode-config"; shift ;;
         --help|-h)             ACTION="help"; shift ;;
@@ -58,13 +64,54 @@ while [[ $# -gt 0 ]]; do
 done
 BASE_URL="http://127.0.0.1:$PORT/v1"
 
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# Stop any deepcopilot proxy currently bound to $PORT. Identifies it via
+# /_proxy/status (which reports {deepcopilot:true,pid}) so we never kill an
+# unrelated server, then waits for the socket to free.
+stop_proxy() {
+    local status pid
+    status="$(curl -fsS --max-time 1 "http://127.0.0.1:$PORT/_proxy/status" 2>/dev/null || true)"
+    [[ -z "$status" ]] && return 1   # nothing of ours there
+    if ! grep -q '"deepcopilot":true' <<<"$status"; then
+        echo "[deepcopilot] port $PORT is held by a non-deepcopilot server; not touching it." >&2
+        return 2
+    fi
+    pid="$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).pid||""))}catch{}})' <<<"$status")"
+    [[ -z "$pid" ]] && return 1
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+        curl -fsS --max-time 1 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || return 0
+        sleep 0.1
+    done
+    kill -9 "$pid" 2>/dev/null || true   # last resort
+    sleep 0.2
+    return 0
+}
 
 case "$ACTION" in
 help)   usage; exit 0 ;;
+stop)
+    if stop_proxy; then echo "stopped deepcopilot proxy on 127.0.0.1:$PORT"
+    else echo "no deepcopilot proxy on 127.0.0.1:$PORT"; fi
+    exit 0 ;;
 status)
     if curl -fsS "http://127.0.0.1:$PORT/_proxy/status" 2>/dev/null; then echo
     else echo "no deepcopilot proxy responding on 127.0.0.1:$PORT"; exit 1; fi
+    exit 0 ;;
+models)
+    # List the model ids exactly as they appear in Copilot's picker (the
+    # slash-free aliases). Enable these in Manage Models -> Ollama.
+    if ! curl -fsS "http://127.0.0.1:$PORT/api/tags" 2>/dev/null \
+        | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{for(const m of JSON.parse(s).models)console.log(m.model)}catch{process.exit(1)}})'; then
+        echo "no deepcopilot proxy on 127.0.0.1:$PORT (start it: deepcopilot -b $BACKEND)" >&2; exit 1
+    fi
+    exit 0 ;;
+logs)
+    # Show what VS Code / clients are calling on the proxy.
+    LOG="$SCRIPT_DIR/proxy/.cache/requests.log"
+    [[ -f "$LOG" ]] || { echo "no request log yet ($LOG). Start the proxy and use it once."; exit 1; }
+    tail -n 40 -f "$LOG"
     exit 0 ;;
 vscode-config)
     cat <<EOF
@@ -106,6 +153,12 @@ esac
 
 command -v node >/dev/null || { echo "node is required (>=18)"; exit 1; }
 
+# ── Replace any stale deepcopilot proxy on this port (reliable restart) ──
+# A previous session whose terminal was closed can leave a proxy bound to
+# the port. It would keep answering /health (so we'd think we're up) while
+# the new proxy fails to bind. Detect and stop it first.
+stop_proxy >/dev/null 2>&1 || true
+
 # ── Start the proxy (background) ──
 PROXY_LOG="$(mktemp -t deepcopilot.XXXXXX.log)"
 node "$SCRIPT_DIR/proxy/start-proxy.js" "$BACKEND" "$PORT" >"$PROXY_LOG" 2>>"$PROXY_LOG" &
@@ -128,7 +181,14 @@ echo "              curl -s -XPOST http://127.0.0.1:$PORT/_proxy/mode -d backend
 export COPILOT_PROVIDER_BASE_URL="$BASE_URL"
 export COPILOT_PROVIDER_TYPE="openai"
 export COPILOT_PROVIDER_API_KEY="deepcopilot"   # key is enforced upstream by the proxy
-export COPILOT_MODEL="${COPILOT_MODEL:-$BACKEND}"
+# Default the model to the chosen backend's PRIMARY model id (the backend
+# name also works as an alias, but a real id is clearer in `copilot`).
+if [[ -z "${COPILOT_MODEL:-}" ]]; then
+    COPILOT_MODEL="$(curl -fsS "http://127.0.0.1:$PORT/_proxy/status" 2>/dev/null \
+        | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);process.stdout.write(j.backends?.[j.defaultBackend]?.model||"")}catch{}})' 2>/dev/null)"
+    [[ -z "$COPILOT_MODEL" ]] && COPILOT_MODEL="$BACKEND"
+fi
+export COPILOT_MODEL
 
 if ! command -v copilot >/dev/null; then
     echo "[deepcopilot] 'copilot' CLI not found. Proxy is running at $BASE_URL." >&2
