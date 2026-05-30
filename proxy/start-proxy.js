@@ -60,7 +60,7 @@ const DEFS = {
     kimi:     { urlDefault: 'https://api.kimi.com/coding',         keyEnv: 'KIMI_API_KEY',     modelEnv: 'KIMI_MODEL',     modelsEnv: 'KIMI_MODELS',     modelDefault: 'kimi-for-coding',      modelsDefault: ['kimi-for-coding'], native: true  },
     // chat.deepseek.com web session (browser auth + WASM PoW). TEXT ONLY:
     // no tool calling. deepseek-v4-pro with thinking on, 1M context.
-    deepseekweb: { urlDefault: 'https://chat.deepseek.com', keyEnv: 'DEEPSEEK_OAUTH_WEB_TOKEN', modelEnv: 'DEEPSEEK_OAUTH_WEB_MODEL', modelsEnv: 'DEEPSEEK_OAUTH_WEB_MODELS', modelDefault: 'deepseek-v4-pro', modelsDefault: ['deepseek-v4-pro:1048576'], defaultCtx: 1048576, web: true, cookieEnv: 'DEEPSEEK_OAUTH_WEB_COOKIE', native: false },
+    deepseekweb: { urlDefault: 'https://chat.deepseek.com', keyEnv: 'DEEPSEEK_OAUTH_WEB_TOKEN', modelEnv: 'DEEPSEEK_OAUTH_WEB_MODEL', modelsEnv: 'DEEPSEEK_OAUTH_WEB_MODELS', modelDefault: 'deepseek-v4-pro-1m', modelsDefault: ['deepseek-v4-pro-1m:1048576'], defaultCtx: 1048576, web: true, cookieEnv: 'DEEPSEEK_OAUTH_WEB_COOKIE', native: false },
 };
 
 function isPlaceholder(v) {
