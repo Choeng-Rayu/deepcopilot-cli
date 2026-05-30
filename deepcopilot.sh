@@ -9,6 +9,7 @@
 #
 # Usage:
 #   deepcopilot [-b nvidia|deepseek|kimi] [--port N] [-- copilot-args]
+#   deepcopilot --daemon [-b ...]  # start proxy DETACHED (for VS Code); survives terminal
 #   deepcopilot --status          # show running proxy status
 #   deepcopilot --models          # list model ids to enable in VS Code
 #   deepcopilot --logs            # tail proxy requests (see what VS Code calls)
@@ -51,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --backend|-b)          BACKEND="$2"; shift 2 ;;
         --port)                PORT="$2"; shift 2 ;;
+        --daemon|--start)      ACTION="daemon"; shift ;;
         --status)              ACTION="status"; shift ;;
         --models)              ACTION="models"; shift ;;
         --logs)                ACTION="logs"; shift ;;
@@ -64,27 +66,33 @@ while [[ $# -gt 0 ]]; do
 done
 BASE_URL="http://127.0.0.1:$PORT/v1"
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # Stop any deepcopilot proxy currently bound to $PORT. Identifies it via
 # /_proxy/status (which reports {deepcopilot:true,pid}) so we never kill an
 # unrelated server, then waits for the socket to free.
 stop_proxy() {
-    local status pid
+    local status pid="" PIDFILE="$SCRIPT_DIR/proxy/.cache/proxy.pid"
     status="$(curl -fsS --max-time 1 "http://127.0.0.1:$PORT/_proxy/status" 2>/dev/null || true)"
-    [[ -z "$status" ]] && return 1   # nothing of ours there
-    if ! grep -q '"deepcopilot":true' <<<"$status"; then
-        echo "[deepcopilot] port $PORT is held by a non-deepcopilot server; not touching it." >&2
-        return 2
+    if [[ -n "$status" ]]; then
+        if ! grep -q '"deepcopilot":true' <<<"$status"; then
+            echo "[deepcopilot] port $PORT is held by a non-deepcopilot server; not touching it." >&2
+            return 2
+        fi
+        pid="$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).pid||""))}catch{}})' <<<"$status")"
     fi
-    pid="$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).pid||""))}catch{}})' <<<"$status")"
+    # Fallback: a frozen proxy (e.g. after Ctrl-Z) still holds the port but
+    # can't answer HTTP. Use the PID file written at startup.
+    [[ -z "$pid" && -f "$PIDFILE" ]] && pid="$(cat "$PIDFILE" 2>/dev/null)"
     [[ -z "$pid" ]] && return 1
+    kill -CONT "$pid" 2>/dev/null || true   # un-freeze a suspended proxy so it can exit
     kill "$pid" 2>/dev/null || true
-    for _ in $(seq 1 30); do
-        curl -fsS --max-time 1 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || return 0
+    for _ in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
         sleep 0.1
     done
-    kill -9 "$pid" 2>/dev/null || true   # last resort
+    kill -9 "$pid" 2>/dev/null || true      # last resort
+    rm -f "$PIDFILE"
     sleep 0.2
     return 0
 }
@@ -159,11 +167,33 @@ command -v node >/dev/null || { echo "node is required (>=18)"; exit 1; }
 # the new proxy fails to bind. Detect and stop it first.
 stop_proxy >/dev/null 2>&1 || true
 
-# ── Start the proxy (background) ──
+# ── Daemon mode: start the proxy DETACHED so it survives this terminal ──
+# This is what VS Code needs — a long-lived Ollama endpoint on the port.
+if [[ "$ACTION" == "daemon" ]]; then
+    DLOG="$SCRIPT_DIR/proxy/.cache/proxy.log"
+    mkdir -p "$(dirname "$DLOG")"
+    setsid node "$SCRIPT_DIR/proxy/start-proxy.js" "$BACKEND" "$PORT" >"$DLOG" 2>&1 < /dev/null &
+    for _ in $(seq 1 80); do
+        curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+        echo "[deepcopilot] proxy running (detached) on $BASE_URL  backend=$BACKEND"
+        echo "[deepcopilot] it will keep running after you close this terminal."
+        echo "[deepcopilot] stop with: deepcopilot --stop   | logs: deepcopilot --logs"
+        exit 0
+    fi
+    echo "[deepcopilot] proxy failed to start; see $DLOG" >&2; tail -5 "$DLOG" >&2; exit 1
+fi
+
+# ── Start the proxy (background, tied to this terminal) ──
+# setsid → own session/process group, so Ctrl-Z (suspend) or Ctrl-C on the
+# foreground `copilot` does NOT freeze/kill the proxy. The cleanup trap below
+# still stops it when this launcher actually exits.
 PROXY_LOG="$(mktemp -t deepcopilot.XXXXXX.log)"
-node "$SCRIPT_DIR/proxy/start-proxy.js" "$BACKEND" "$PORT" >"$PROXY_LOG" 2>>"$PROXY_LOG" &
+setsid node "$SCRIPT_DIR/proxy/start-proxy.js" "$BACKEND" "$PORT" >"$PROXY_LOG" 2>>"$PROXY_LOG" < /dev/null &
 PROXY_PID=$!
-cleanup() { kill "$PROXY_PID" 2>/dev/null || true; rm -f "$PROXY_LOG"; }
+cleanup() { kill "$PROXY_PID" 2>/dev/null || true; rm -f "$PROXY_LOG" "$SCRIPT_DIR/proxy/.cache/proxy.pid"; }
 trap cleanup EXIT INT TERM
 
 # ── Wait for health ──

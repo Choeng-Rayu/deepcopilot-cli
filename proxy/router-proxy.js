@@ -29,6 +29,7 @@ import {
     anthropicMessageToOpenAI,
     AnthropicToOpenAIStream,
 } from './openai-anthropic.js';
+import { solvePowChallenge } from './deepseek-pow.js';
 
 const REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_CTX = 131072;
@@ -169,7 +170,9 @@ export async function startProxy(opts) {
         const wantsStream = body.stream !== false;
 
         try {
-            if (backend.native) {
+            if (backend.web) {
+                await forwardDeepSeekWeb(res, body, backend, upstreamModel, wantsStream, stats, log);
+            } else if (backend.native) {
                 await forwardKimi(res, body, backend, upstreamModel, wantsStream, stats, log);
             } else {
                 await forwardOpenAI(res, body, backend, upstreamModel, stats, log);
@@ -243,6 +246,290 @@ function forwardKimi(res, body, backend, upstreamModel, wantsStream, stats, log)
         'x-api-key': backend.key,
         'authorization': `Bearer ${backend.key}`,
     }, { translate: true, wantsStream, model: body.model, stats, log });
+}
+
+
+// ── chat.deepseek.com web session (browser auth + WASM PoW) ──────
+// TEXT ONLY (no tool calling). Flattens the OpenAI conversation to one
+// prompt, solves the per-turn sha3 PoW, then re-emits the site's
+// JSON-patch SSE as OpenAI chat.completion.chunk SSE (content ->
+// delta.content, thinking_content -> delta.reasoning_content).
+const DS_WEB_HOST = 'chat.deepseek.com';
+const DS_WEB_BASE = '/api/v0';
+
+function dsWebHeaders(backend, extra = {}) {
+    return {
+        'accept': '*/*',
+        'authorization': `Bearer ${backend.key}`,
+        'content-type': 'application/json',
+        'origin': 'https://chat.deepseek.com',
+        'referer': 'https://chat.deepseek.com/',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+        'x-app-version': '20241129.1',
+        'x-client-locale': 'en_US',
+        'x-client-platform': 'web',
+        'x-client-version': '1.0.0-always',
+        ...(backend.cookie ? { cookie: backend.cookie } : {}),
+        ...extra,
+    };
+}
+
+function dsWebPostJson(backend, path, payload) {
+    return new Promise((resolve, reject) => {
+        const body = JSON.stringify(payload);
+        const req = httpsRequest({
+            host: DS_WEB_HOST, port: 443, method: 'POST', path: DS_WEB_BASE + path,
+            headers: dsWebHeaders(backend, { 'content-length': Buffer.byteLength(body) }),
+            timeout: REQUEST_TIMEOUT_MS, family: 4,
+        }, (r) => {
+            let buf = '';
+            r.on('data', c => buf += c);
+            r.on('end', () => {
+                if (r.statusCode !== 200) return reject(new Error(`${path} → HTTP ${r.statusCode}: ${buf.slice(0, 300)}`));
+                try { resolve(JSON.parse(buf)); } catch { reject(new Error(`${path} → invalid JSON: ${buf.slice(0, 200)}`)); }
+            });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => req.destroy(new Error(`${path} timed out`)));
+        req.write(body); req.end();
+    });
+}
+
+// Collapse the OpenAI conversation (incl. tool blocks) into one prompt.
+// When `tools` are provided, prepend an instruction preamble so the
+// (text-only) model can emit tool calls as <tool_call>{json}</tool_call>
+// markers, which we parse back into OpenAI tool_calls (emulated/prompted
+// tool calling — the standard technique for models without native tools).
+function flattenMessagesToPrompt(messages, tools) {
+    const lines = [];
+    if (tools && tools.length) lines.push(buildToolPreamble(tools));
+    for (const m of (messages || [])) {
+        if (m.role === 'system') { if (m.content) lines.push(contentText(m.content)); continue; }
+        if (m.role === 'tool') { lines.push(`[tool result for ${m.tool_call_id || ''}]: ${contentText(m.content)}`); continue; }
+        const role = m.role === 'assistant' ? 'Assistant' : 'User';
+        let text = contentText(m.content);
+        for (const tc of (m.tool_calls || [])) {
+            text += `\n<tool_call>${JSON.stringify({ name: tc.function?.name, arguments: safeParse(tc.function?.arguments) })}</tool_call>`;
+        }
+        if (text.trim()) lines.push(`${role}: ${text}`);
+    }
+    return lines.join('\n\n');
+}
+function contentText(content) {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) return content.map(p => typeof p === 'string' ? p : (p.text || '')).join('');
+    return '';
+}
+function safeParse(s) { try { return JSON.parse(s || '{}'); } catch { return {}; } }
+
+function buildToolPreamble(tools) {
+    const defs = tools.filter(t => t.type === 'function' && t.function).map(t => ({
+        name: t.function.name,
+        description: t.function.description || '',
+        parameters: t.function.parameters || { type: 'object', properties: {} },
+    }));
+    return [
+        'You are an AI agent that can call tools. The following tools are available (JSON Schema):',
+        '```json',
+        JSON.stringify(defs, null, 2),
+        '```',
+        'When you need to call a tool, output ONE OR MORE markers, each on its own line, with NOTHING else around them:',
+        '<tool_call>{"name":"<tool_name>","arguments":{<args matching the schema>}}</tool_call>',
+        'Rules:',
+        '- Emit a <tool_call> marker only when you actually want to call a tool; the arguments MUST be valid JSON.',
+        '- You may emit multiple <tool_call> markers to call several tools at once.',
+        '- Do NOT wrap tool calls in code fences. Do NOT explain the call. After tool results come back, continue.',
+        '- If you do not need a tool, just answer normally in plain text.',
+    ].join('\n');
+}
+
+// Parse tool calls out of model text. Tolerates <tool_call> markers,
+// unterminated markers, and ```json fenced/bare tool objects. Returns
+// { calls:[OpenAI tool_call], text:<markers removed>, notes:[diagnostics] }.
+function parseToolCalls(text) {
+    const calls = [];
+    const notes = [];      // diagnostics for the tool-debug log
+    let i = 0;
+    const add = (obj, via) => {
+        if (!obj || typeof obj !== 'object' || !obj.name) return false;
+        const args = obj.arguments ?? obj.parameters ?? obj.args ?? {};
+        calls.push({ id: `call_${Date.now()}_${i++}`, type: 'function',
+            function: { name: obj.name, arguments: typeof args === 'string' ? args : JSON.stringify(args) } });
+        if (via !== 'marker') notes.push(`recovered via ${via}: ${obj.name}`);
+        return true;
+    };
+
+    let cleaned = text;
+
+    // 1. Canonical <tool_call>...</tool_call> markers (tolerate ``` fences inside).
+    cleaned = cleaned.replace(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g, (full, inner) => {
+        const body = inner.replace(/^```(?:json)?\s*|\s*```$/g, '').trim();
+        try { if (add(JSON.parse(body), 'marker')) return ''; } catch {}
+        notes.push(`marker failed to parse: ${body.slice(0, 120)}`);
+        return '';
+    });
+
+    // 2. Unterminated <tool_call> (model forgot the closing tag).
+    if (calls.length === 0 && /<tool_call>/.test(cleaned)) {
+        const m = /<tool_call>\s*([\s\S]*)$/.exec(cleaned);
+        if (m) {
+            const body = m[1].replace(/<\/tool_call>/g, '').replace(/^```(?:json)?\s*|\s*```$/g, '').trim();
+            try { if (add(JSON.parse(body), 'unterminated-marker')) cleaned = cleaned.replace(m[0], ''); }
+            catch { notes.push(`unterminated marker unparseable: ${body.slice(0, 120)}`); }
+        }
+    }
+
+    // 3. Fallback: a ```json fence or bare top-level object that looks like a
+    //    tool call ({"name":...,"arguments":...}) — some models ignore the tag.
+    if (calls.length === 0) {
+        const fence = /```(?:json)?\s*(\{[\s\S]*?\})\s*```/g;
+        let f;
+        while ((f = fence.exec(cleaned)) !== null) {
+            try { const o = JSON.parse(f[1]); if (o && o.name && (o.arguments || o.parameters || o.args)) { if (add(o, 'code-fence')) cleaned = cleaned.replace(f[0], ''); } } catch {}
+        }
+    }
+
+    return { calls, text: cleaned.replace(/<\/?tool_call>/g, '').trim(), notes };
+}
+
+// Dedicated tool-debug log so we can diagnose tool-call format issues on the
+// DeepSeek web backend. Appends to proxy/.cache/deepseek-tools.log.
+const DS_TOOL_LOG = join(dirname(fileURLToPath(import.meta.url)), '.cache', 'deepseek-tools.log');
+function dsToolLog(msg) {
+    try { appendFileSync(DS_TOOL_LOG, `${new Date().toISOString()} ${msg}\n`); } catch {}
+    if (process.env.DEEPCOPILOT_DEBUG === '1') console.error('[deepcopilot][dstools]', msg);
+}
+
+async function forwardDeepSeekWeb(res, body, backend, upstreamModel, wantsStream, stats, log) {
+    const tools = Array.isArray(body.tools) ? body.tools : [];
+    const hasTools = tools.length > 0;
+    const prompt = flattenMessagesToPrompt(body.messages, tools);
+    const thinking = true; // thinking mode ON (deepseek-v4-pro reasoning)
+    const id = `chatcmpl-${Date.now()}`, created = Math.floor(Date.now() / 1000);
+    const model = upstreamModel || backend.model;
+    if (hasTools) dsToolLog(`REQUEST id=${id} tools=[${tools.map(t => t.function?.name).join(', ')}] stream=${wantsStream}`);
+
+    // 1. session  2. PoW challenge → solve
+    const sess = await dsWebPostJson(backend, '/chat_session/create', { character_id: null });
+    const sid = sess?.data?.biz_data?.id;
+    if (!sid) throw new Error('no session id in chat_session/create response');
+    const chResp = await dsWebPostJson(backend, '/chat/create_pow_challenge', { target_path: '/api/v0/chat/completion' });
+    const challenge = chResp?.data?.biz_data?.challenge;
+    if (!challenge) throw new Error('no challenge in create_pow_challenge response');
+    const pow = await solvePowChallenge(challenge);
+    log(`deepseek web: session=${sid.slice(0, 8)} prompt=${prompt.length}b thinking=${thinking}`);
+
+    // 3. completion (always stream from upstream; we adapt to client)
+    const reqBody = JSON.stringify({
+        chat_session_id: sid, parent_message_id: null, prompt,
+        ref_file_ids: [], thinking_enabled: thinking, search_enabled: false,
+    });
+    const headers = dsWebHeaders(backend, {
+        accept: 'text/event-stream', 'x-ds-pow-response': pow,
+        'content-length': Buffer.byteLength(reqBody),
+    });
+
+    await new Promise((resolve, reject) => {
+        const upstream = httpsRequest({
+            host: DS_WEB_HOST, port: 443, method: 'POST', path: DS_WEB_BASE + '/chat/completion',
+            headers, timeout: REQUEST_TIMEOUT_MS, family: 4,
+        }, (upRes) => {
+            if (upRes.statusCode !== 200) {
+                const chunks = [];
+                upRes.on('data', c => chunks.push(c));
+                upRes.on('end', () => {
+                    if (!res.headersSent) res.writeHead(upRes.statusCode, { 'content-type': 'application/json' });
+                    res.end(Buffer.concat(chunks)); resolve();
+                });
+                return;
+            }
+            log('deepseek web replied: 200 OK');
+
+            // Streaming path → OpenAI chat.completion.chunk SSE.
+            const emit = (delta, finish = null) => {
+                const chunk = { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finish }] };
+                res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+            };
+            // When tools are in play we must buffer the whole answer so we can
+            // detect <tool_call> markers (they span chunks) and convert them to
+            // OpenAI tool_calls. Without tools we stream content live.
+            const streamLive = wantsStream && !hasTools;
+            let fullContent = '', nonStreamText = '';
+            if (streamLive) {
+                res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+                emit({ role: 'assistant', content: '' });
+            }
+
+            let buf = '', curPath = null, finished = false;
+            const finish = () => {
+                if (finished) return; finished = true;
+                if (hasTools) {
+                    // Parse markers out of the buffered answer.
+                    const { calls, text, notes } = parseToolCalls(fullContent);
+                    // Tool-debug log: raw output + parse outcome for diagnosis.
+                    dsToolLog(`RAW id=${id} (${fullContent.length}b): ${JSON.stringify(fullContent.slice(0, 1200))}`);
+                    (notes || []).forEach(n => dsToolLog(`NOTE id=${id}: ${n}`));
+                    if (calls.length) dsToolLog(`PARSED id=${id} ${calls.length} call(s): ${calls.map(c => `${c.function.name}(${c.function.arguments})`).join(' | ')}`);
+                    else if (hasTools) dsToolLog(`NO-CALL id=${id}: model returned text only (${text.length}b)`);
+                    const finishReason = calls.length ? 'tool_calls' : 'stop';
+                    if (wantsStream) {
+                        if (!res.headersSent) res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+                        emit({ role: 'assistant', content: text || '' });
+                        calls.forEach((c, i) => emit({ tool_calls: [{ index: i, id: c.id, type: 'function', function: c.function }] }));
+                        emit({}, finishReason);
+                        res.write('data: [DONE]\n\n');
+                        res.end();
+                    } else {
+                        const message = { role: 'assistant', content: calls.length ? null : (text || '') };
+                        if (calls.length) message.tool_calls = calls;
+                        json(res, 200, { id, object: 'chat.completion', created, model,
+                            choices: [{ index: 0, message, finish_reason: finishReason }],
+                            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
+                    }
+                } else if (streamLive) {
+                    emit({}, 'stop');
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+                } else {
+                    json(res, 200, { id, object: 'chat.completion', created, model,
+                        choices: [{ index: 0, message: { role: 'assistant', content: nonStreamText }, finish_reason: 'stop' }],
+                        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
+                }
+                stats && (stats.byBackend.__lastModel = model);
+                resolve();
+            };
+            const onData = (s) => {
+                if (finished) return;
+                let d; try { d = JSON.parse(s); } catch { return; }
+                if (typeof d.p === 'string') curPath = d.p;   // sticky path cursor
+                const v = d.v;
+                if (curPath === 'response/content' && typeof v === 'string') {
+                    if (streamLive) emit({ content: v });
+                    else if (hasTools) fullContent += v;
+                    else nonStreamText += v;
+                } else if (curPath === 'response/thinking_content' && typeof v === 'string') {
+                    if (streamLive) emit({ reasoning_content: v });   // hidden while buffering for tools
+                } else if (curPath === 'response/status' && v === 'FINISHED') {
+                    finish();
+                }
+            };
+            upRes.on('data', (c) => {
+                buf += c.toString();
+                let idx;
+                while ((idx = buf.indexOf('\n\n')) !== -1) {
+                    const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
+                    for (const line of block.split('\n')) {
+                        if (line.startsWith('data:')) onData(line.slice(5).replace(/^ /, ''));
+                    }
+                }
+            });
+            upRes.on('end', finish);
+            upRes.on('error', reject);
+        });
+        upstream.on('error', reject);
+        upstream.on('timeout', () => upstream.destroy(new Error(`deepseek web timeout`)));
+        upstream.write(reqBody); upstream.end();
+    });
 }
 
 
