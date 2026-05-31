@@ -52,7 +52,7 @@ help)   sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 stop)   if stop_proxy; then echo "stopped VS Code proxy on 127.0.0.1:$PORT"; else echo "no VS Code proxy on 127.0.0.1:$PORT"; fi; exit 0 ;;
 status) curl -fsS "http://127.0.0.1:$PORT/_proxy/status" 2>/dev/null && echo || { echo "no deepcopilot proxy on 127.0.0.1:$PORT"; exit 1; }; exit 0 ;;
 models) list_models || { echo "no proxy on 127.0.0.1:$PORT (start it: copilot-vscode -b $BACKEND)" >&2; exit 1; }; exit 0 ;;
-logs)   [[ -f "$REQUEST_LOG" ]] || { echo "no request log yet ($REQUEST_LOG). Use Copilot in VS Code once."; exit 1; }; tail -n 40 -f "$REQUEST_LOG"; exit 0 ;;
+logs)   [[ -f "$REQUEST_LOG" ]] || { echo "no request log yet ($REQUEST_LOG). Use Copilot in VS Code once."; exit 1; }; live_tail "$REQUEST_LOG" 40; exit 0 ;;
 config)
     cat <<EOF
 VS Code setup — Copilot's built-in "Ollama" provider, replaced by deepcopilot:
@@ -88,8 +88,15 @@ stop_proxy >/dev/null 2>&1 || true
 setsid node "$SCRIPT_DIR/proxy/start-proxy.js" "$BACKEND" "$PORT" >"$PROXY_LOG" 2>&1 < /dev/null &
 if wait_health ""; then
     echo "[deepcopilot] proxy running (detached) on $BASE_URL  backend=$BACKEND"
-    echo "[deepcopilot] survives terminal close. stop: copilot-vscode --stop | logs: copilot-vscode --logs"
+    echo "[deepcopilot] survives terminal close. stop: copilot-vscode --stop"
     echo "[deepcopilot] VS Code: enable your models in Manage Models -> Ollama (copilot-vscode --config)"
+    echo "[deepcopilot] ── live logs (Ctrl-C stops this view; proxy keeps running) ──"
+    # Foreground into a live tail so VS Code's calls are visible in real time.
+    # The proxy is detached, so Ctrl-C here only ends the tail, not the proxy.
+    # --use-polling avoids "inotify watch limit reached" (common when VS Code is
+    # running); fall back to plain -f if this tail lacks the flag.
+    trap 'echo; echo "[deepcopilot] proxy still running on '"$BASE_URL"' (stop: copilot-vscode --stop)"; exit 0' INT
+    live_tail "$REQUEST_LOG" 0
     exit 0
 fi
 exit 1

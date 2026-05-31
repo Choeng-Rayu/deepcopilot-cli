@@ -52,7 +52,7 @@ help)   sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 stop)   if stop_proxy; then echo "stopped CLI proxy on 127.0.0.1:$PORT"; else echo "no CLI proxy on 127.0.0.1:$PORT"; fi; exit 0 ;;
 status) curl -fsS "http://127.0.0.1:$PORT/_proxy/status" 2>/dev/null && echo || { echo "no deepcopilot proxy on 127.0.0.1:$PORT"; exit 1; }; exit 0 ;;
 models) list_models || { echo "no proxy on 127.0.0.1:$PORT (start it: copilot-cli -b $BACKEND)" >&2; exit 1; }; exit 0 ;;
-logs)   [[ -f "$REQUEST_LOG" ]] || { echo "no request log yet ($REQUEST_LOG). Start a session first."; exit 1; }; tail -n 40 -f "$REQUEST_LOG"; exit 0 ;;
+logs)   [[ -f "$REQUEST_LOG" ]] || { echo "no request log yet ($REQUEST_LOG). Start a session first."; exit 1; }; live_tail "$REQUEST_LOG" 40; exit 0 ;;
 esac
 
 command -v node >/dev/null || { echo "node is required (>=18)"; exit 1; }

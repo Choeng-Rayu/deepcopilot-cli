@@ -119,7 +119,10 @@ if (Object.keys(backends).length === 0) {
 }
 
 const [backendArg, portArg] = process.argv.slice(2);
+// Canonicalize short aliases (nv→nvidia, ds→deepseek, web→deepseekweb).
+const ALIAS = { nv: 'nvidia', ds: 'deepseek', deepseekoauthweb: 'deepseekweb', web: 'deepseekweb' };
 let defaultBackend = (backendArg || process.env.API_PROVIDER || Object.keys(backends)[0]).toLowerCase();
+defaultBackend = ALIAS[defaultBackend] || defaultBackend;
 if (!backends[defaultBackend]) {
     console.error(`[deepcopilot] default backend "${defaultBackend}" has no key; falling back to ${Object.keys(backends)[0]}`);
     defaultBackend = Object.keys(backends)[0];

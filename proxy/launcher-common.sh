@@ -60,3 +60,10 @@ list_models() {
     curl -fsS "http://127.0.0.1:$PORT/api/tags" 2>/dev/null \
         | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{for(const m of JSON.parse(s).models)console.log(m.model)}catch{process.exit(1)}})'
 }
+
+# Follow a log file live. Uses --use-polling to avoid "inotify watch limit
+# reached" (common when VS Code is running); falls back to plain -f. $1=file, $2=initial lines.
+live_tail() {
+    local f="$1" n="${2:-40}"
+    tail -n "$n" --use-polling -f "$f" 2>/dev/null || tail -n "$n" -f "$f"
+}

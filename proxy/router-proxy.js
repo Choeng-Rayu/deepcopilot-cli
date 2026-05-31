@@ -33,6 +33,10 @@ import {
 import { solvePowChallenge } from './deepseek-pow.js';
 
 const REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+// If the upstream sends NO byte within this window, treat the model as stalled
+// (e.g. an NVIDIA model outage) and fail fast with a clear message instead of
+// letting the client (VS Code) spin until the full request timeout.
+const FIRST_BYTE_TIMEOUT_MS = Number(process.env.DEEPCOPILOT_TTFB_MS) || 30000;
 const DEFAULT_CTX = 131072;
 
 /**
@@ -75,7 +79,14 @@ export async function startProxy(opts) {
     }
 
     const stats = { requests: 0, byBackend: {}, errors: 0, lastModel: null };
-    const log = (...a) => { if (debug) console.error('[deepcopilot]', ...a); };
+    // Always persist diagnostics to the request log (timestamped); also echo to
+    // stderr when debug. This is what makes VS Code issues identifiable: model
+    // routing, upstream status, and errors all land in the log file.
+    const log = (...a) => {
+        const line = `${new Date().toISOString()} ${a.join(' ')}`;
+        try { appendFileSync(logFile, line + '\n'); } catch {}
+        if (debug) console.error('[deepcopilot]', ...a);
+    };
 
     // Resolve a requested model (alias OR real id OR backend name) → backend +
     // real upstream id. Unknown / 'auto' / 'copilot' / absent → default primary.
@@ -247,7 +258,7 @@ function forwardOpenAI(res, body, backend, upstreamModel, stats, log) {
         'content-type': 'application/json',
         'authorization': `Bearer ${backend.key}`,
         'accept': body.stream !== false ? 'text/event-stream' : 'application/json',
-    }, { passthrough: true, wantsStream: body.stream !== false, stats, log });
+    }, { passthrough: true, wantsStream: body.stream !== false, model: body.model, stats, log });
 }
 
 
@@ -639,6 +650,22 @@ function pipeUpstream(res, url, payload, headers, mode) {
             resolve();
         };
 
+        // First-byte watchdog: covers the WHOLE window from request start until
+        // the upstream's first byte — including connection/headers stalls (the
+        // response callback may never fire if the provider hangs). On timeout we
+        // fail fast with a clear message instead of waiting REQUEST_TIMEOUT_MS.
+        let gotFirstByte = false, settled = false;
+        const onStall = () => {
+            if (gotFirstByte || settled) return;
+            settled = true;
+            mode.log && mode.log(`upstream stalled (no data in ${FIRST_BYTE_TIMEOUT_MS}ms)`);
+            try { upstream.destroy(); } catch {}
+            if (res.headersSent) failStream(`Model "${mode.model || ''}" is not responding (no data in ${Math.round(FIRST_BYTE_TIMEOUT_MS/1000)}s). The provider may be overloaded — try another model.`);
+            else { json(res, 504, { error: { message: `Model "${mode.model || ''}" is not responding (no data in ${Math.round(FIRST_BYTE_TIMEOUT_MS/1000)}s). Try another model.`, code: 'upstream_timeout' } }); resolve(); }
+        };
+        const firstByteTimer = setTimeout(onStall, FIRST_BYTE_TIMEOUT_MS);
+        const markFirstByte = () => { gotFirstByte = true; clearTimeout(firstByteTimer); };
+
         const upstream = reqLib({
             host: url.hostname,
             port: url.port || (url.protocol === 'https:' ? 443 : 80),
@@ -648,8 +675,10 @@ function pipeUpstream(res, url, payload, headers, mode) {
             timeout: REQUEST_TIMEOUT_MS,
         }, (up) => {
             mode.log && mode.log(`upstream ${up.statusCode} ${up.statusMessage}`);
+            up.once('data', markFirstByte);     // any byte clears the stall watchdog
 
             if (up.statusCode !== 200) {
+                markFirstByte();                 // a non-200 response is itself a "byte"
                 const chunks = [];
                 up.on('data', c => chunks.push(c));
                 up.on('end', () => {
@@ -712,6 +741,9 @@ function pipeUpstream(res, url, payload, headers, mode) {
         });
 
         upstream.on('error', (e) => {
+            clearTimeout(firstByteTimer);
+            if (settled) return;                 // watchdog already handled it
+            settled = true;
             if (!res.headersSent) { json(res, 502, { error: { message: e.message } }); resolve(); }
             else failStream(String(e.message || e));
         });
