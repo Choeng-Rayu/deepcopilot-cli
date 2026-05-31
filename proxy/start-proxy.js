@@ -38,13 +38,13 @@ loadEnv(join(__dirname, '.env'));
 // "id:contextTokens" sets each model's real context window (Copilot shows
 // context - maxOutput as max input). Defaults to 131072 when omitted.
 const NVIDIA_DEFAULT_MODELS = [
-    'openai/gpt-oss-120b:131072',
-    'deepseek-ai/deepseek-v4-flash:163840',
+    'openai/gpt-oss-120b:128000',
+    'deepseek-ai/deepseek-v4-flash:1048576',
     'qwen/qwen3-coder-480b-a35b-instruct:262144',
-    'deepseek-ai/deepseek-v4-pro:163840',
+    'deepseek-ai/deepseek-v4-pro:1048576',
     'moonshotai/kimi-k2.6:262144',
     'stepfun-ai/step-3.7-flash:262144',
-    'z-ai/glm-5.1:204800',
+    'z-ai/glm-5.1:131072',
     'minimaxai/minimax-m2.7:204800',
     'qwen/qwen3.5-397b-a17b:262144',
     'nvidia/nemotron-3-super-120b-a12b:1048576',
