@@ -74,25 +74,38 @@ backend-name alias and `auto`). Browse available ids at the provider's
 ## Use with Copilot CLI
 
 ```bash
-./deepcopilot.sh                 # default backend from API_PROVIDER
-./deepcopilot.sh -b deepseek     # start on DeepSeek
-./deepcopilot.sh -b kimi -- --help    # args after -- go to `copilot`
+./deepcopilot.sh                                  # default backend from API_PROVIDER
+./deepcopilot.sh -b nvidia -m nvidia__nemotron-3-super-120b-a12b   # pick a model
+./deepcopilot.sh --models                         # list model ids you can pass to -m
+./deepcopilot.sh -b kimi -- --help                # args after -- go to `copilot`
 ```
 
-This starts the proxy, exports the Copilot BYOK env vars, and launches `copilot`. If `copilot` isn't installed it leaves the proxy running and tells you the base URL.
+This starts the proxy, exports the Copilot BYOK env vars (including the model's
+real context window), and launches `copilot`. If `copilot` isn't installed it
+leaves the proxy running and tells you the base URL.
 
-### Switch provider live (no restart)
+### Choosing the model (important: the CLI is one model per session)
 
-The CLI selects a model per session. Two ways to switch without restarting the proxy:
+The GitHub Copilot CLI's BYOK mode is **hardcoded to a single model** — its
+interactive `/model` command only ever shows the one model you launched with,
+and it never queries the proxy's model list. (This is a CLI limitation: it has
+only `openai`/`azure`/`anthropic` provider types, no multi-model Ollama
+provider. **VS Code does** show all models because it has an Ollama provider —
+see the VS Code section.)
 
-- Set the model when launching a session: `COPILOT_MODEL=deepseek copilot` (the proxy is already running).
-- Repoint the **`auto`** alias at runtime, affecting new requests that use model `auto`:
+So to use a different model in the CLI, **relaunch** with `-m`:
 
 ```bash
-curl -s -XPOST http://127.0.0.1:11434/_proxy/mode -d backend=kimi
+./deepcopilot.sh -b nvidia -m qwen__qwen3-coder-480b-a35b-instruct
 ```
 
-Use `--model nvidia|deepseek|kimi` (or the real model id) inside Copilot to pin a specific provider.
+`-m` sets the model, its real context window, and identity for that session.
+Run `./deepcopilot.sh --models` for the exact ids. A wrong/typo'd model now
+returns a clear error instead of silently using the default.
+
+> The proxy's `auto` alias and `POST /_proxy/mode` still let you repoint the
+> default backend at runtime, but the CLI sends a fixed model per session, so
+> `-m` (relaunch) is the reliable switch for the CLI.
 
 ---
 

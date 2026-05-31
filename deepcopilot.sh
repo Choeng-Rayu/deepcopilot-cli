@@ -8,7 +8,8 @@
 #   providers with no restart.
 #
 # Usage:
-#   deepcopilot [-b nvidia|deepseek|kimi] [--port N] [-- copilot-args]
+#   deepcopilot [-b nvidia|deepseek|kimi] [-m MODEL] [--port N] [-- copilot-args]
+#   deepcopilot -m deepseek-v4-pro-1m   # pick the CLI model for this session
 #   deepcopilot --daemon [-b ...]  # start proxy DETACHED (for VS Code); survives terminal
 #   deepcopilot --status          # show running proxy status
 #   deepcopilot --models          # list model ids to enable in VS Code
@@ -46,11 +47,13 @@ fi
 
 PORT="${DEEPCOPILOT_PORT:-11434}"
 BACKEND="${API_PROVIDER:-nvidia}"
+MODEL=""          # -m/--model: pick the exact model the CLI uses this session
 ACTION="launch"
 PASS_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --backend|-b)          BACKEND="$2"; shift 2 ;;
+        --model|-m)            MODEL="$2"; shift 2 ;;
         --port)                PORT="$2"; shift 2 ;;
         --daemon|--start)      ACTION="daemon"; shift ;;
         --status)              ACTION="status"; shift ;;
@@ -66,7 +69,7 @@ while [[ $# -gt 0 ]]; do
 done
 BASE_URL="http://127.0.0.1:$PORT/v1"
 
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # Stop any deepcopilot proxy currently bound to $PORT. Identifies it via
 # /_proxy/status (which reports {deepcopilot:true,pid}) so we never kill an
@@ -196,29 +199,52 @@ PROXY_PID=$!
 cleanup() { kill "$PROXY_PID" 2>/dev/null || true; rm -f "$PROXY_LOG" "$SCRIPT_DIR/proxy/.cache/proxy.pid"; }
 trap cleanup EXIT INT TERM
 
-# ── Wait for health ──
-for _ in $(seq 1 50); do
-    curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-    kill -0 "$PROXY_PID" 2>/dev/null || { echo "proxy failed to start:"; cat "$PROXY_LOG"; exit 1; }
+# ── Wait for health (block until the proxy truly answers, so copilot never
+# launches into "can't connect / transient error" while node is still booting) ──
+_ready=0
+for _ in $(seq 1 150); do
+    if curl -fsS --max-time 1 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then _ready=1; break; fi
+    kill -0 "$PROXY_PID" 2>/dev/null || { echo "[deepcopilot] proxy failed to start:" >&2; cat "$PROXY_LOG" >&2; exit 1; }
     sleep 0.1
 done
+[[ "$_ready" == 1 ]] || { echo "[deepcopilot] proxy not ready after 15s; see $PROXY_LOG" >&2; cat "$PROXY_LOG" >&2; exit 1; }
 
 echo "[deepcopilot] proxy on $BASE_URL  (default backend: $BACKEND)" >&2
-echo "[deepcopilot] switch live in a session with COPILOT_MODEL=nvidia|deepseek|kimi, or:" >&2
-echo "              curl -s -XPOST http://127.0.0.1:$PORT/_proxy/mode -d backend=deepseek   (changes the 'auto' target)" >&2
+echo "[deepcopilot] pick a model with -m <id> (list: deepcopilot --models). The CLI uses ONE model per session." >&2
 
 # ── Hand off to Copilot CLI via BYOK env ──
 export COPILOT_PROVIDER_BASE_URL="$BASE_URL"
 export COPILOT_PROVIDER_TYPE="openai"
 export COPILOT_PROVIDER_API_KEY="deepcopilot"   # key is enforced upstream by the proxy
-# Default the model to the chosen backend's PRIMARY model id (the backend
-# name also works as an alias, but a real id is clearer in `copilot`).
-if [[ -z "${COPILOT_MODEL:-}" ]]; then
+# The Copilot CLI uses ONE model per session (BYOK has no model picker; it
+# never calls /v1/models). Pick it with -m/--model; otherwise default to the
+# chosen backend's PRIMARY model. To switch, restart with a different -m, or
+# repoint the 'auto' alias at runtime via POST /_proxy/mode.
+if [[ -n "$MODEL" ]]; then
+    COPILOT_MODEL="$MODEL"
+    # Warn if the model isn't one the proxy serves (helps catch typos).
+    if ! curl -fsS "http://127.0.0.1:$PORT/v1/models" 2>/dev/null \
+        | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const ids=JSON.parse(s).data.map(m=>m.id);process.exit(ids.includes(process.argv[1])?0:1)}catch{process.exit(1)}})' "$MODEL"; then
+        echo "[deepcopilot] WARNING: model '$MODEL' is not in the proxy's model list (run: deepcopilot --models). Using it anyway." >&2
+    fi
+elif [[ -z "${COPILOT_MODEL:-}" ]]; then
     COPILOT_MODEL="$(curl -fsS "http://127.0.0.1:$PORT/_proxy/status" 2>/dev/null \
         | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);process.stdout.write(j.backends?.[j.defaultBackend]?.model||"")}catch{}})' 2>/dev/null)"
     [[ -z "$COPILOT_MODEL" ]] && COPILOT_MODEL="$BACKEND"
 fi
 export COPILOT_MODEL
+export COPILOT_PROVIDER_MODEL_ID="$COPILOT_MODEL"   # token-limit/agent config hint
+# Tell the CLI the model's REAL context window; otherwise it defaults to 128k.
+# Pull it from the proxy's /api/show (which has each model's true context).
+CTX="$(curl -fsS -XPOST "http://127.0.0.1:$PORT/api/show" -d "{\"model\":\"$COPILOT_MODEL\"}" 2>/dev/null \
+    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const mi=JSON.parse(s).model_info||{};const a=mi["general.architecture"];process.stdout.write(String(mi[a+".context_length"]||""))}catch{}})' 2>/dev/null)"
+if [[ "$CTX" =~ ^[0-9]+$ ]]; then
+    export COPILOT_PROVIDER_MAX_PROMPT_TOKENS="$CTX"
+    [[ -z "${COPILOT_PROVIDER_MAX_OUTPUT_TOKENS:-}" ]] && export COPILOT_PROVIDER_MAX_OUTPUT_TOKENS="16384"
+    echo "[deepcopilot] CLI model: $COPILOT_MODEL  (context: $CTX tokens; change with -m <model>)" >&2
+else
+    echo "[deepcopilot] CLI model: $COPILOT_MODEL  (change with -m <model>; list: deepcopilot --models)" >&2
+fi
 
 if ! command -v copilot >/dev/null; then
     echo "[deepcopilot] 'copilot' CLI not found. Proxy is running at $BASE_URL." >&2
@@ -228,4 +254,4 @@ if ! command -v copilot >/dev/null; then
     exit 0
 fi
 
-copilot "${PASS_ARGS[@]}"
+copilot --model "$COPILOT_MODEL" "${PASS_ARGS[@]}"

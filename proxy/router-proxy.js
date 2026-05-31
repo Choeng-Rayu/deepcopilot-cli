@@ -21,6 +21,7 @@
 import { createServer } from 'http';
 import { request as httpsRequest } from 'https';
 import { request as httpRequest } from 'http';
+import { Transform } from 'stream';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -80,8 +81,15 @@ export async function startProxy(opts) {
     // real upstream id. Unknown / 'auto' / 'copilot' / absent → default primary.
     const resolve = (model) => {
         if (model) {
-            const hit = modelOwner.get(String(model).toLowerCase());
+            const key = String(model).toLowerCase();
+            const hit = modelOwner.get(key);
             if (hit) return hit;
+            // Only these explicit aliases fall back to the default backend.
+            // ANY other unknown model is an error (don't silently mask it as
+            // the default model — that hid mis-selections as gpt-oss).
+            if (key !== 'auto' && key !== 'copilot' && key !== 'default') {
+                return null;
+            }
         }
         return { backend: defaultBackend, modelId: backends[defaultBackend]?.model };
     };
@@ -157,7 +165,18 @@ export async function startProxy(opts) {
         } catch {
             return json(res, 400, { error: { message: 'invalid JSON body' } });
         }
-        const { backend: backendName, modelId } = resolve(body.model);
+        const resolved = resolve(body.model);
+        if (!resolved) {
+            // Unknown model — surface it instead of silently using the default.
+            stats.errors++;
+            const valid = listModels(backends, aliasOf).data.map(m => m.id);
+            log(`unknown model "${body.model}" → 400 (valid: ${valid.join(', ')})`);
+            return json(res, 400, { error: {
+                message: `Unknown model "${body.model}". Valid models: ${valid.join(', ')}. (Use 'auto' for the default backend.)`,
+                code: 'model_not_found', type: 'invalid_request_error', param: 'model',
+            }});
+        }
+        const { backend: backendName, modelId } = resolved;
         const backend = backends[backendName];
         stats.byBackend[backendName] = (stats.byBackend[backendName] || 0) + 1;
         stats.lastModel = body.model || null;
@@ -533,6 +552,70 @@ async function forwardDeepSeekWeb(res, body, backend, upstreamModel, wantsStream
 }
 
 
+// Strip non-standard fields from OpenAI-passthrough SSE so the Copilot CLI
+// renders text instead of dumping raw JSON. Rebuilds each chunk with ONLY
+// standard OpenAI fields. NVIDIA reasoning models add non-standard fields at
+// the chunk level (prompt_token_ids) and choice level (token_ids, stop_reason)
+// and stream the visible answer in delta.reasoning_content/reasoning while
+// content is empty — we surface that reasoning text as `content` so the CLI
+// shows it instead of nothing.
+class OpenAISanitizeStream extends Transform {
+    constructor() { super(); this._buf = ''; this._sawContent = false; }
+    _transform(chunk, _enc, cb) {
+        this._buf += chunk.toString();
+        const parts = this._buf.split('\n');
+        this._buf = parts.pop();
+        for (const line of parts) this.push(this._fixLine(line) + '\n');
+        cb();
+    }
+    _flush(cb) { if (this._buf) this.push(this._fixLine(this._buf)); cb(); }
+    _fixLine(line) {
+        const s = line.trimStart();
+        if (!s.startsWith('data:')) return line;          // event:/blank/comment lines pass through
+        const payload = s.slice(5).trim();
+        if (payload === '' || payload === '[DONE]') return line;
+        let j; try { j = JSON.parse(payload); } catch { return line; }
+        if (!j || !Array.isArray(j.choices)) return line;
+        // Rebuild chunk with only standard top-level fields (drops
+        // prompt_token_ids and any other non-standard chunk fields).
+        const clean = {
+            id: j.id, object: j.object || 'chat.completion.chunk',
+            created: j.created, model: j.model,
+        };
+        if (j.usage) clean.usage = j.usage;
+        clean.choices = j.choices.map(c => {
+            const out = { index: c.index ?? 0, finish_reason: c.finish_reason ?? null };
+            if (c.delta) {
+                const d = {}, src = c.delta;
+                if (src.role !== undefined) d.role = src.role;
+                // Visible text: prefer real content; else surface reasoning so
+                // the answer isn't blank for reasoning models.
+                let textPiece = (src.content !== undefined && src.content !== null) ? src.content : '';
+                if (textPiece) this._sawContent = true;
+                if (!textPiece && !this._sawContent) {
+                    const r = src.reasoning_content ?? src.reasoning;
+                    if (typeof r === 'string') textPiece = r;
+                }
+                if (textPiece) d.content = textPiece;
+                if (src.tool_calls !== undefined) d.tool_calls = src.tool_calls;
+                if (src.refusal !== undefined && src.refusal !== null) d.refusal = src.refusal;
+                out.delta = d;
+            }
+            if (c.message) {            // non-stream safety (rare on this path)
+                const src = c.message;
+                out.message = {
+                    role: src.role || 'assistant',
+                    content: (src.content ?? src.reasoning_content ?? src.reasoning ?? '') || '',
+                    ...(src.tool_calls ? { tool_calls: src.tool_calls } : {}),
+                };
+            }
+            return out;
+        });
+        return 'data: ' + JSON.stringify(clean);
+    }
+}
+
+
 // ── Shared upstream plumbing ─────────────────────────────────────
 function pipeUpstream(res, url, payload, headers, mode) {
     return new Promise((resolve, reject) => {
@@ -562,15 +645,26 @@ function pipeUpstream(res, url, payload, headers, mode) {
                 return;
             }
 
-            // OpenAI passthrough: stream bytes straight through.
+            // OpenAI passthrough. For SSE we sanitize each chunk to STANDARD
+            // OpenAI fields — some providers (NVIDIA nemotron) add non-standard
+            // delta fields (reasoning, reasoning_content, token_ids, stop_reason)
+            // that the Copilot CLI can't render and dumps as raw JSON. Non-SSE
+            // bodies pass through unchanged.
             if (mode.passthrough) {
-                res.writeHead(200, {
-                    'content-type': up.headers['content-type'] || 'application/json',
-                    'cache-control': 'no-cache',
-                });
-                up.pipe(res);
-                up.on('end', resolve);
-                up.on('error', reject);
+                const ct = up.headers['content-type'] || 'application/json';
+                if (/event-stream/i.test(ct)) {
+                    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+                    const tx = new OpenAISanitizeStream();
+                    up.pipe(tx).pipe(res);
+                    tx.on('end', resolve);
+                    tx.on('error', reject);
+                    up.on('error', reject);
+                } else {
+                    res.writeHead(200, { 'content-type': ct, 'cache-control': 'no-cache' });
+                    up.pipe(res);
+                    up.on('end', resolve);
+                    up.on('error', reject);
+                }
                 return;
             }
 
