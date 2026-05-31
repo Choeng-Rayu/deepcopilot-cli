@@ -127,11 +127,13 @@ if (!backends[defaultBackend]) {
 const port = parseInt(portArg || process.env.DEEPCOPILOT_PORT || '11434', 10);
 
 try {
-    const { port: actualPort } = await startProxy({ port, backends, contexts, defaultBackend });
+    const logFile = process.env.DEEPCOPILOT_REQUEST_LOG || undefined;
+    const { port: actualPort } = await startProxy({ port, backends, contexts, defaultBackend, logFile });
     // PID file so the launcher can stop a proxy even if it's frozen (Ctrl-Z)
     // and can't answer HTTP. Best-effort.
     try {
-        const pidFile = join(__dirname, '.cache', 'proxy.pid');
+        const reqLog = process.env.DEEPCOPILOT_REQUEST_LOG;
+        const pidFile = reqLog ? join(dirname(reqLog), 'proxy.pid') : join(__dirname, '.cache', 'proxy.pid');
         mkdirSync(dirname(pidFile), { recursive: true });
         writeFileSync(pidFile, String(process.pid));
     } catch {}

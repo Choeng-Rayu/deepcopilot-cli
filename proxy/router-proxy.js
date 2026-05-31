@@ -247,7 +247,7 @@ function forwardOpenAI(res, body, backend, upstreamModel, stats, log) {
         'content-type': 'application/json',
         'authorization': `Bearer ${backend.key}`,
         'accept': body.stream !== false ? 'text/event-stream' : 'application/json',
-    }, { passthrough: true, stats, log });
+    }, { passthrough: true, wantsStream: body.stream !== false, stats, log });
 }
 
 
@@ -622,6 +622,23 @@ function pipeUpstream(res, url, payload, headers, mode) {
         const reqLib = url.protocol === 'https:' ? httpsRequest : httpRequest;
         headers['content-length'] = String(payload.length);
 
+        // For streaming requests, commit 200 SSE headers IMMEDIATELY — before
+        // the upstream's first byte. Node fetch/undici (VS Code) aborts with
+        // UND_ERR_HEADERS_TIMEOUT (~10s) if headers are late on a slow model,
+        // surfacing as a confusing "terminated". Native providers send headers
+        // up front and keep the connection alive; we match that. Once headers
+        // are sent we can't change status, so upstream errors become SSE chunks.
+        const earlyStream = !!mode.wantsStream;
+        if (earlyStream && !res.headersSent) {
+            res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', 'connection': 'keep-alive' });
+            res.flushHeaders();                  // push headers now so undici's headers-timeout never trips
+        }
+        const failStream = (msg) => {     // emit an OpenAI-style error as SSE, then close
+            try { res.write(`data: ${JSON.stringify({ error: { message: msg } })}\n\ndata: [DONE]\n\n`); } catch {}
+            try { res.end(); } catch {}
+            resolve();
+        };
+
         const upstream = reqLib({
             host: url.hostname,
             port: url.port || (url.protocol === 'https:' ? 443 : 80),
@@ -636,12 +653,13 @@ function pipeUpstream(res, url, payload, headers, mode) {
                 const chunks = [];
                 up.on('data', c => chunks.push(c));
                 up.on('end', () => {
-                    if (!res.headersSent) {
-                        res.writeHead(up.statusCode, { 'content-type': up.headers['content-type'] || 'application/json' });
-                    }
-                    res.end(Buffer.concat(chunks));
+                    const bodyStr = Buffer.concat(chunks).toString('utf8');
+                    if (res.headersSent) { failStream(`upstream ${up.statusCode}: ${bodyStr.slice(0, 500)}`); return; }
+                    res.writeHead(up.statusCode, { 'content-type': up.headers['content-type'] || 'application/json' });
+                    res.end(bodyStr);
                     resolve();
                 });
+                up.on('error', () => res.headersSent ? failStream(`upstream ${up.statusCode}`) : reject(new Error(`upstream ${up.statusCode}`)));
                 return;
             }
 
@@ -652,13 +670,13 @@ function pipeUpstream(res, url, payload, headers, mode) {
             // bodies pass through unchanged.
             if (mode.passthrough) {
                 const ct = up.headers['content-type'] || 'application/json';
-                if (/event-stream/i.test(ct)) {
-                    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+                if (/event-stream/i.test(ct) || earlyStream) {
+                    if (!res.headersSent) res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
                     const tx = new OpenAISanitizeStream();
                     up.pipe(tx).pipe(res);
                     tx.on('end', resolve);
                     tx.on('error', reject);
-                    up.on('error', reject);
+                    up.on('error', e => failStream(String(e.message || e)));
                 } else {
                     res.writeHead(200, { 'content-type': ct, 'cache-control': 'no-cache' });
                     up.pipe(res);
@@ -670,12 +688,12 @@ function pipeUpstream(res, url, payload, headers, mode) {
 
             // Kimi translate path.
             if (mode.wantsStream) {
-                res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+                if (!res.headersSent) res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
                 const tx = new AnthropicToOpenAIStream(mode.model);
                 up.pipe(tx).pipe(res);
                 tx.on('end', resolve);
                 tx.on('error', reject);
-                up.on('error', reject);
+                up.on('error', e => failStream(String(e.message || e)));
             } else {
                 const chunks = [];
                 up.on('data', c => chunks.push(c));
@@ -694,10 +712,10 @@ function pipeUpstream(res, url, payload, headers, mode) {
         });
 
         upstream.on('error', (e) => {
-            if (!res.headersSent) json(res, 502, { error: { message: e.message } });
-            else res.end();
-            resolve();
+            if (!res.headersSent) { json(res, 502, { error: { message: e.message } }); resolve(); }
+            else failStream(String(e.message || e));
         });
+        upstream.on('timeout', () => upstream.destroy(new Error('upstream timed out')));
         upstream.write(payload);
         upstream.end();
     });
